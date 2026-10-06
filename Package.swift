@@ -19,6 +19,13 @@
 import class Foundation.ProcessInfo
 import PackageDescription
 
+// Mori fork: Firestore always builds from source, so the gRPC channel-argument
+// API in Firestore/core/src/remote/grpc_connection.cc is what actually ships
+// (the prebuilt binary does not contain it). This is the single switch the
+// four source/binary decisions read. Declared before `package` because
+// top-level manifest code runs in order.
+let firestoreBuildsFromSource = true
+
 let firebaseVersion = "11.15.0"
 
 let package = Package(
@@ -167,9 +174,12 @@ let package = Package(
       url: "https://github.com/google/GoogleUtilities.git",
       "8.1.0" ..< "9.0.0"
     ),
+    // Mori fork: GTM comes from dori-life/gtm-session-fetcher (adds
+    // +setGlobalSessionConfigurationPolicy:), pinned to an exact commit so the
+    // whole graph has one GTM source.
     .package(
-      url: "https://github.com/google/gtm-session-fetcher.git",
-      "3.4.1" ..< "5.0.0"
+      url: "https://github.com/dori-life/gtm-session-fetcher.git",
+      revision: "309704ea1b55264100ed0c861e715c27de1cd17b"
     ),
     .package(
       url: "https://github.com/firebase/nanopb.git",
@@ -1452,7 +1462,7 @@ func abseilDependency() -> Package.Dependency {
 
   // If building Firestore from source, abseil will need to be built as source
   // as the headers in the binary version of abseil are unusable.
-  if ProcessInfo.processInfo.environment["FIREBASE_SOURCE_FIRESTORE"] != nil {
+  if firestoreBuildsFromSource {
     packageInfo = (
       "https://github.com/firebase/abseil-cpp-SwiftPM.git",
       "0.20240722.0" ..< "0.20240723.0"
@@ -1472,7 +1482,7 @@ func grpcDependency() -> Package.Dependency {
 
   // If building Firestore from source, abseil will need to be built as source
   // as the headers in the binary version of abseil are unusable.
-  if ProcessInfo.processInfo.environment["FIREBASE_SOURCE_FIRESTORE"] != nil {
+  if firestoreBuildsFromSource {
     packageInfo = ("https://github.com/grpc/grpc-ios.git", "1.69.0" ..< "1.70.0")
   } else {
     packageInfo = ("https://github.com/google/grpc-binary.git", "1.69.0" ..< "1.70.0")
@@ -1482,7 +1492,7 @@ func grpcDependency() -> Package.Dependency {
 }
 
 func firestoreWrapperTarget() -> Target {
-  if ProcessInfo.processInfo.environment["FIREBASE_SOURCE_FIRESTORE"] != nil {
+  if firestoreBuildsFromSource {
     return .target(
       name: "FirebaseFirestoreTarget",
       dependencies: [.target(name: "FirebaseFirestore",
@@ -1501,7 +1511,7 @@ func firestoreWrapperTarget() -> Target {
 }
 
 func firestoreTargets() -> [Target] {
-  if ProcessInfo.processInfo.environment["FIREBASE_SOURCE_FIRESTORE"] != nil {
+  if firestoreBuildsFromSource {
     return [
       .target(
         name: "FirebaseFirestoreInternalWrapper",
