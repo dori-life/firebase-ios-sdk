@@ -300,6 +300,24 @@ NS_SWIFT_NAME(Firestore)
 /** Enables or disables logging from the Firestore client. */
 + (void)enableLogging:(BOOL)logging;
 
+#pragma mark - gRPC channel arguments
+
+/**
+ * Replaces the extra gRPC channel arguments applied to every *secure* channel Firestore creates
+ * after this call returns. Channels that already exist are not changed. Pass nil to clear.
+ *
+ * The whole dictionary is validated and converted first; on any invalid entry this returns NO,
+ * fills `error`, and the previously installed arguments stay in effect (all-or-nothing).
+ * Keys: non-empty NSString without NUL. Values: NSString without NUL, or NSNumber holding an
+ * integer in [INT_MIN, INT_MAX] (floating, NaN, BOOL-vs-int ambiguity and overflow are rejected,
+ * never truncated). Keys that Firestore itself sets on the channel are rejected.
+ * Not applied to emulator / insecure channels.
+ *
+ * This is a Mori fork addition; it is not part of upstream Firebase.
+ */
++ (BOOL)setGlobalGrpcChannelArguments:(nullable NSDictionary<NSString *, id> *)arguments
+                                error:(NSError **)error;
+
 #pragma mark - Network
 
 /**

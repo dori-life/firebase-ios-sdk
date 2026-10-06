@@ -20,9 +20,11 @@
 
 #import "FIRFirestore+Internal.h"
 
+#include <climits>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #import "FIRFirestoreSettings+Internal.h"
 #import "FIRPersistentCacheIndexManager+Internal.h"
@@ -52,6 +54,7 @@
 #include "Firestore/core/src/credentials/credentials_provider.h"
 #include "Firestore/core/src/model/database_id.h"
 #include "Firestore/core/src/remote/firebase_metadata_provider.h"
+#include "Firestore/core/src/remote/grpc_connection.h"
 #include "Firestore/core/src/util/async_queue.h"
 #include "Firestore/core/src/util/byte_stream_apple.h"
 #include "Firestore/core/src/util/config.h"
@@ -74,6 +77,9 @@ using firebase::firestore::core::EventListener;
 using firebase::firestore::credentials::AuthCredentialsProvider;
 using firebase::firestore::model::DatabaseId;
 using firebase::firestore::remote::FirebaseMetadataProvider;
+using firebase::firestore::remote::GrpcConnection;
+using firebase::firestore::remote::GrpcExtraChannelArg;
+using firebase::firestore::remote::GrpcExtraChannelArgs;
 using firebase::firestore::util::AsyncQueue;
 using firebase::firestore::util::ByteStreamApple;
 using firebase::firestore::util::Empty;
@@ -106,6 +112,75 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, strong, readonly) FSTUserDataReader *dataReader;
 
 @end
+
+namespace {
+
+BOOL ContainsNul(NSString *string) {
+  const unichar nul = 0;
+  return [string rangeOfString:[NSString stringWithCharacters:&nul length:1]].location !=
+         NSNotFound;
+}
+
+NSError *InvalidChannelArgumentError(NSString *message) {
+  return firebase::firestore::util::MakeNSError(firebase::firestore::Error::kErrorInvalidArgument,
+                                                MakeString(message));
+}
+
+/**
+ * Converts an NSNumber holding an integer in [INT_MIN, INT_MAX] to `int`. Returns NO for
+ * booleans, floating-point values (including NaN and integral-valued doubles) and integers out
+ * of range; never truncates.
+ */
+BOOL ConvertChannelArgumentNumber(NSNumber *number,
+                                  int *result,
+                                  NSString *_Nullable *_Nonnull reason) {
+  if (CFGetTypeID((__bridge CFTypeRef)number) == CFBooleanGetTypeID()) {
+    *reason = @"booleans are not accepted (ambiguous with integers)";
+    return NO;
+  }
+  const char *type = number.objCType;
+  if (type == nullptr || type[0] == '\0' || type[1] != '\0') {
+    *reason = @"unsupported numeric type";
+    return NO;
+  }
+  switch (type[0]) {
+    case 'c':
+    case 's':
+    case 'i':
+    case 'l':
+    case 'q': {
+      long long value = number.longLongValue;
+      if (value < INT_MIN || value > INT_MAX) {
+        *reason = @"integer is out of range [INT_MIN, INT_MAX]";
+        return NO;
+      }
+      *result = static_cast<int>(value);
+      return YES;
+    }
+    case 'C':
+    case 'S':
+    case 'I':
+    case 'L':
+    case 'Q': {
+      unsigned long long value = number.unsignedLongLongValue;
+      if (value > static_cast<unsigned long long>(INT_MAX)) {
+        *reason = @"integer is out of range [INT_MIN, INT_MAX]";
+        return NO;
+      }
+      *result = static_cast<int>(value);
+      return YES;
+    }
+    case 'f':
+    case 'd':
+      *reason = @"floating-point values are not accepted";
+      return NO;
+    default:
+      *reason = @"unsupported numeric type";
+      return NO;
+  }
+}
+
+}  // namespace
 
 @implementation FIRFirestore {
   std::shared_ptr<Firestore> _firestore;
@@ -413,6 +488,87 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (void)enableLogging:(BOOL)logging {
   LogSetLevel(logging ? kLogLevelDebug : kLogLevelNotice);
+}
+
+#pragma mark - gRPC channel arguments
+
++ (BOOL)setGlobalGrpcChannelArguments:(nullable NSDictionary<NSString *, id> *)arguments
+                                error:(NSError **)error {
+  GrpcExtraChannelArgs converted;
+  NSError *conversionError = nil;
+
+  if (arguments != nil && ![arguments isKindOfClass:[NSDictionary class]]) {
+    conversionError = InvalidChannelArgumentError(@"gRPC channel arguments must be a dictionary");
+  }
+
+  if (conversionError == nil) {
+    converted.reserve(arguments.count);
+    for (id key in arguments) {
+      if (![key isKindOfClass:[NSString class]]) {
+        conversionError = InvalidChannelArgumentError([NSString
+            stringWithFormat:@"gRPC channel argument key %@ (%@) must be a string", key,
+                             NSStringFromClass([key class])]);
+        break;
+      }
+      NSString *keyString = key;
+      if (keyString.length == 0) {
+        conversionError =
+            InvalidChannelArgumentError(@"gRPC channel argument key must not be empty");
+        break;
+      }
+      if (ContainsNul(keyString)) {
+        conversionError = InvalidChannelArgumentError([NSString
+            stringWithFormat:@"gRPC channel argument key '%@' must not contain NUL characters",
+                             keyString]);
+        break;
+      }
+
+      id value = arguments[key];
+      if ([value isKindOfClass:[NSString class]]) {
+        NSString *stringValue = value;
+        if (ContainsNul(stringValue)) {
+          conversionError = InvalidChannelArgumentError([NSString
+              stringWithFormat:@"Value of gRPC channel argument '%@' must not contain NUL "
+                               @"characters",
+                               keyString]);
+          break;
+        }
+        converted.push_back(
+            GrpcExtraChannelArg::String(MakeString(keyString), MakeString(stringValue)));
+      } else if ([value isKindOfClass:[NSNumber class]]) {
+        int intValue = 0;
+        NSString *reason = nil;
+        if (!ConvertChannelArgumentNumber(value, &intValue, &reason)) {
+          conversionError = InvalidChannelArgumentError([NSString
+              stringWithFormat:@"Value %@ of gRPC channel argument '%@' is invalid: %@", value,
+                               keyString, reason]);
+          break;
+        }
+        converted.push_back(GrpcExtraChannelArg::Int(MakeString(keyString), intValue));
+      } else {
+        conversionError = InvalidChannelArgumentError([NSString
+            stringWithFormat:@"Value of gRPC channel argument '%@' has unsupported type %@; "
+                             @"expected NSString or integer NSNumber",
+                             keyString, NSStringFromClass([value class])]);
+        break;
+      }
+    }
+  }
+
+  if (conversionError == nil) {
+    Status status = GrpcConnection::SetGlobalExtraChannelArgs(std::move(converted));
+    if (!status.ok()) {
+      conversionError = firebase::firestore::util::MakeNSError(status);
+    }
+  }
+
+  if (conversionError != nil) {
+    if (error) {
+      *error = conversionError;
+    }
+    return NO;
+  }
+  return YES;
 }
 
 - (void)useEmulatorWithHost:(NSString *)host port:(NSInteger)port {

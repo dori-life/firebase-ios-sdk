@@ -135,6 +135,9 @@ class GrpcStreamTester {
 
   GrpcStreamTester(const std::shared_ptr<util::AsyncQueue>& worker_queue,
                    ConnectivityMonitor* connectivity_monitor);
+  GrpcStreamTester(const std::shared_ptr<util::AsyncQueue>& worker_queue,
+                   ConnectivityMonitor* connectivity_monitor,
+                   core::DatabaseInfo database_info);
   ~GrpcStreamTester();
 
   /** Finishes the stream and shuts down the gRPC completion queue. */

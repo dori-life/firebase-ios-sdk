@@ -1,3 +1,39 @@
+# Mori fork of firebase-ios-sdk
+
+This is the `dori-life` fork of firebase-ios-sdk used by the Mori app. It is upstream
+**11.15.0** (`fdc352fa`) plus the changes below; everything else is unchanged.
+
+**New API: global extra gRPC channel arguments (Firestore).**
+
+```objc
+// FIRFirestore
++ (BOOL)setGlobalGrpcChannelArguments:(nullable NSDictionary<NSString *, id> *)arguments
+                                error:(NSError **)error;
+```
+
+Swift: `try Firestore.setGlobalGrpcChannelArguments(["grpc.http_proxy": "http://127.0.0.1:<port>"])`.
+
+- Lifecycle: process-wide. Each call replaces the previous arguments and applies to every
+  *secure* gRPC channel Firestore creates after it returns (default TLS and test-certificate
+  TLS). Existing channels are not changed. `nil` (or an empty dictionary) clears. Never applied
+  to insecure / emulator channels.
+- All-or-nothing validation: keys are non-empty `NSString` without NUL; values are `NSString`
+  without NUL or an integer `NSNumber` in `[INT_MIN, INT_MAX]` (floating-point, NaN, BOOL and
+  overflow are rejected). Keys Firestore sets itself (`grpc.primary_user_agent`,
+  `grpc.keepalive_time_ms`, `grpc.ssl_target_name_override`) are rejected. On failure the
+  method returns `NO` with a `FIRFirestoreErrorDomain` / `FIRFirestoreErrorCodeInvalidArgument`
+  error and the previous arguments stay in effect.
+- Implementation: `Firestore/Source/API/FIRFirestore.mm` (validation) and
+  `GrpcConnection::SetGlobalExtraChannelArgs` in `Firestore/core/src/remote/grpc_connection.{h,cc}`.
+
+**Package.swift (separate commit):** defaults Firestore to source mode (instead of the binary
+`FirebaseFirestoreInternal`) so this change is compiled in, and points the GTMSessionFetcher
+dependency at `dori-life/gtm-session-fetcher`.
+
+Difference vs upstream 11.15.0: only the items above. LICENSE and NOTICE are unchanged.
+
+---
+
 <p align="center">
   <a href="https://cocoapods.org/pods/Firebase">
     <img src="https://img.shields.io/github/v/release/Firebase/firebase-ios-sdk?style=flat&label=CocoaPods"/>

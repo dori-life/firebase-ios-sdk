@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -213,6 +214,99 @@ void AddCloudApiHeader(grpc::ClientContext& context) {
   context.AddMetadata(kXGoogApiClientHeader, api_tokens);
 }
 
+// Channel argument keys that Firestore sets on the channels it creates. Extra
+// channel arguments must not collide with these (see
+// `GrpcConnection::SetGlobalExtraChannelArgs`).
+const char* const kReservedChannelArgKeys[] = {
+    // Set by the `grpc::ChannelArguments` constructor that `CreateChannel`
+    // uses for every channel.
+    GRPC_ARG_PRIMARY_USER_AGENT_STRING,
+    // Set by `CreateChannel` for every channel.
+    GRPC_ARG_KEEPALIVE_TIME_MS,
+    // Set by `CreateChannel` (via `SetSslTargetNameOverride`) for
+    // test-certificate channels.
+    GRPC_SSL_TARGET_NAME_OVERRIDE_ARG,
+};
+
+class GlobalExtraChannelArgs {
+  using Guard = std::lock_guard<std::mutex>;
+
+ public:
+  void Set(std::shared_ptr<const GrpcExtraChannelArgs> new_value) {
+    Guard guard(mutex_);
+    args_ = std::move(new_value);
+  }
+
+  std::shared_ptr<const GrpcExtraChannelArgs> Get() const {
+    Guard guard(mutex_);
+    return args_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::shared_ptr<const GrpcExtraChannelArgs> args_;
+};
+
+GlobalExtraChannelArgs& ExtraChannelArgs() {
+  static util::NoDestructor<GlobalExtraChannelArgs> args;
+  return *args;
+}
+
+/**
+ * Applies the currently installed extra channel arguments to `args`. Takes a
+ * snapshot under the lock and iterates outside of it.
+ */
+void ApplyGlobalExtraChannelArgs(grpc::ChannelArguments& args) {
+  std::shared_ptr<const GrpcExtraChannelArgs> snapshot =
+      ExtraChannelArgs().Get();
+  if (!snapshot) {
+    return;
+  }
+  for (const GrpcExtraChannelArg& arg : *snapshot) {
+    switch (arg.type) {
+      case GrpcExtraChannelArg::Type::kString:
+        args.SetString(arg.key, arg.string_value);
+        break;
+      case GrpcExtraChannelArg::Type::kInt:
+        args.SetInt(arg.key, arg.int_value);
+        break;
+    }
+  }
+}
+
+class ChannelArgsObserverHolder {
+  using Guard = std::lock_guard<std::mutex>;
+
+ public:
+  void Set(GrpcConnection::ChannelArgsObserver new_value) {
+    Guard guard(mutex_);
+    observer_ = std::move(new_value);
+  }
+
+  GrpcConnection::ChannelArgsObserver Get() const {
+    Guard guard(mutex_);
+    return observer_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  GrpcConnection::ChannelArgsObserver observer_;
+};
+
+ChannelArgsObserverHolder& ChannelArgsObserverStorage() {
+  static util::NoDestructor<ChannelArgsObserverHolder> observer;
+  return *observer;
+}
+
+void NotifyChannelArgsObserver(GrpcConnection::ChannelKind kind,
+                               const grpc::ChannelArguments& args) {
+  GrpcConnection::ChannelArgsObserver observer =
+      ChannelArgsObserverStorage().Get();
+  if (observer) {
+    observer(kind, args);
+  }
+}
+
 #if __APPLE__
 // Disable CFStream-based transport on Apple platforms due to b/133182964, where
 // CFStream will occasionally fail to raise a has-bytes-available events,
@@ -308,6 +402,8 @@ std::shared_ptr<grpc::Channel> GrpcConnection::CreateChannel() const {
 
   const HostConfig* host_config = Config().find(host);
   if (!host_config) {
+    ApplyGlobalExtraChannelArgs(args);
+    NotifyChannelArgsObserver(ChannelKind::kSecure, args);
     std::string root_certificate = LoadGrpcRootCertificate();
     return grpc::CreateCustomChannel(
         host, CreateSslCredentials(root_certificate), args);
@@ -315,6 +411,9 @@ std::shared_ptr<grpc::Channel> GrpcConnection::CreateChannel() const {
 
   // For the case when `Settings.set_ssl_enabled(false)`.
   if (host_config->use_insecure_channel()) {
+    // Extra channel arguments are deliberately not applied to insecure
+    // (emulator) channels.
+    NotifyChannelArgsObserver(ChannelKind::kInsecure, args);
     return grpc::CreateCustomChannel(host, grpc::InsecureChannelCredentials(),
                                      args);
   }
@@ -329,6 +428,8 @@ std::shared_ptr<grpc::Channel> GrpcConnection::CreateChannel() const {
                            path.ToUtf8String())
                   .c_str());
 
+  ApplyGlobalExtraChannelArgs(args);
+  NotifyChannelArgsObserver(ChannelKind::kTestSecure, args);
   return grpc::CreateCustomChannel(
       host, CreateSslCredentials(test_certificate.ValueOrDie()), args);
 }
@@ -415,6 +516,70 @@ void GrpcConnection::UseTestCertificate(const std::string& host,
                                         const Path& certificate_path,
                                         const std::string& target_name) {
   Config().UseTestCertificate(host, certificate_path, target_name);
+}
+
+util::Status GrpcConnection::SetGlobalExtraChannelArgs(
+    GrpcExtraChannelArgs args) {
+  std::set<std::string> seen_keys;
+  for (const GrpcExtraChannelArg& arg : args) {
+    if (arg.key.empty()) {
+      return Status{Error::kErrorInvalidArgument,
+                    "gRPC channel argument key must not be empty"};
+    }
+    if (arg.key.find('\0') != std::string::npos) {
+      return Status{Error::kErrorInvalidArgument,
+                    StringFormat("gRPC channel argument key '%s' must not "
+                                 "contain NUL characters",
+                                 arg.key)};
+    }
+    if (IsReservedChannelArgKey(arg.key)) {
+      return Status{Error::kErrorInvalidArgument,
+                    StringFormat("gRPC channel argument '%s' is set by "
+                                 "Firestore and cannot be overridden",
+                                 arg.key)};
+    }
+    if (!seen_keys.insert(arg.key).second) {
+      return Status{
+          Error::kErrorInvalidArgument,
+          StringFormat("gRPC channel argument '%s' is specified more than once",
+                       arg.key)};
+    }
+    if (arg.type == GrpcExtraChannelArg::Type::kString &&
+        arg.string_value.find('\0') != std::string::npos) {
+      return Status{Error::kErrorInvalidArgument,
+                    StringFormat("Value of gRPC channel argument '%s' must "
+                                 "not contain NUL characters",
+                                 arg.key)};
+    }
+  }
+
+  if (args.empty()) {
+    ExtraChannelArgs().Set(nullptr);
+  } else {
+    ExtraChannelArgs().Set(
+        std::make_shared<const GrpcExtraChannelArgs>(std::move(args)));
+  }
+  return Status::OK();
+}
+
+bool GrpcConnection::IsReservedChannelArgKey(const std::string& key) {
+  for (const char* reserved : kReservedChannelArgKeys) {
+    if (key == reserved) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void GrpcConnection::SetChannelArgsObserverForTesting(
+    ChannelArgsObserver observer) {
+  ChannelArgsObserverStorage().Set(std::move(observer));
+}
+
+GrpcExtraChannelArgs GrpcConnection::GetGlobalExtraChannelArgsForTesting() {
+  std::shared_ptr<const GrpcExtraChannelArgs> snapshot =
+      ExtraChannelArgs().Get();
+  return snapshot ? *snapshot : GrpcExtraChannelArgs{};
 }
 
 }  // namespace remote
