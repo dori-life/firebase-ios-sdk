@@ -33,6 +33,7 @@ namespace firebase {
 namespace firestore {
 namespace remote {
 
+using core::DatabaseInfo;
 using credentials::AuthToken;
 using credentials::User;
 using model::DatabaseId;
@@ -204,9 +205,17 @@ std::future<void> FakeGrpcQueue::KeepPolling(
 GrpcStreamTester::GrpcStreamTester(
     const std::shared_ptr<AsyncQueue>& worker_queue,
     ConnectivityMonitor* connectivity_monitor)
+    : GrpcStreamTester{worker_queue, connectivity_monitor,
+                       DatabaseInfo{DatabaseId{"foo", "bar"}, "",
+                                    "firestore.googleapis.com", false}} {
+}
+
+GrpcStreamTester::GrpcStreamTester(
+    const std::shared_ptr<AsyncQueue>& worker_queue,
+    ConnectivityMonitor* connectivity_monitor,
+    DatabaseInfo database_info)
     : worker_queue_{NOT_NULL(worker_queue)},
-      database_info_{DatabaseId{"foo", "bar"}, "", "firestore.googleapis.com",
-                     false},
+      database_info_{std::move(database_info)},
       fake_grpc_queue_{&grpc_queue_},
       firebase_metadata_provider_{CreateFirebaseMetadataProviderNoOp()},
       grpc_connection_{database_info_, worker_queue, fake_grpc_queue_.queue(),
